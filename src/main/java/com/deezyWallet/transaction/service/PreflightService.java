@@ -1,22 +1,27 @@
 package com.deezyWallet.transaction.service;
 
-import com.deezyWallet.transaction.constants.TxnConstants;
-import com.deezyWallet.transaction.constants.TxnErrorCode;
-import com.deezyWallet.transaction.dto.client.FraudEvaluationDto;
-import com.deezyWallet.transaction.dto.client.UserStatusDto;
-import com.deezyWallet.transaction.dto.client.WalletBalanceDto;
-import com.deezyWallet.transaction.enums.TransactionTypeEnum;
-import com.deezyWallet.transaction.exception.*;
-import com.deezyWallet.transaction.security.UserPrincipal;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import java.math.BigDecimal;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestTemplate;
 
-import java.math.BigDecimal;
+import com.deezyWallet.transaction.constants.TxnConstants;
+import com.deezyWallet.transaction.constants.TxnErrorCode;
+import com.deezyWallet.transaction.dto.client.FraudEvaluationDto;
+import com.deezyWallet.transaction.dto.client.UserStatusDto;
+import com.deezyWallet.transaction.dto.client.WalletBalanceDto;
+import com.deezyWallet.transaction.enums.TransactionTypeEnum;
+import com.deezyWallet.transaction.exception.ExternalServiceException;
+import com.deezyWallet.transaction.exception.FraudRejectedException;
+import com.deezyWallet.transaction.exception.FraudServiceException;
+import com.deezyWallet.transaction.exception.TransactionValidationException;
+import com.deezyWallet.transaction.security.UserPrincipal;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * PreflightService — synchronous checks run BEFORE the Saga starts.
@@ -68,8 +73,7 @@ public class PreflightService {
 	@Value("${services.fraud-service.base-url}")
 	private String fraudServiceBaseUrl;
 
-	@Value("${services.internal-jwt}")
-	private String internalJwt;  // Static internal service JWT for service-to-service calls
+	// Token injection handled automatically by InternalAuthInterceptor on RestTemplate
 
 	// ── Public API ────────────────────────────────────────────────────────────
 
@@ -102,7 +106,7 @@ public class PreflightService {
 		validateReceiverActive(receiverStatus);
 
 		// 5. Amount ceiling
-		validateAmountLimit(amount, TransactionType.P2P_TRANSFER);
+		validateAmountLimit(amount, TransactionTypeEnum.P2P_TRANSFER);
 
 		// 6. Sender wallet balance preflight
 		WalletBalanceDto senderBalance = fetchWalletBalance(senderPrincipal.getUserId());
@@ -114,7 +118,7 @@ public class PreflightService {
 		// 8. Fraud evaluation
 		BigDecimal fraudScore = evaluateFraud(
 				senderPrincipal, receiverUserId, senderBalance.getWalletId(),
-				receiverWalletId, amount, TransactionType.P2P_TRANSFER);
+				receiverWalletId, amount, TransactionTypeEnum.P2P_TRANSFER);
 
 		return PreflightResult.builder()
 				.senderWalletId(senderBalance.getWalletId())
@@ -141,7 +145,7 @@ public class PreflightService {
 		}
 
 		// 3. Amount ceiling
-		validateAmountLimit(amount, TransactionType.MERCHANT_PAYMENT);
+		validateAmountLimit(amount, TransactionTypeEnum.MERCHANT_PAYMENT);
 
 		// 4. Sender balance preflight
 		WalletBalanceDto senderBalance = fetchWalletBalance(senderPrincipal.getUserId());
@@ -153,7 +157,7 @@ public class PreflightService {
 		// 6. Fraud evaluation
 		BigDecimal fraudScore = evaluateFraud(
 				senderPrincipal, merchantUserId, senderBalance.getWalletId(),
-				merchantWalletId, amount, TransactionType.MERCHANT_PAYMENT);
+				merchantWalletId, amount, TransactionTypeEnum.MERCHANT_PAYMENT);
 
 		return PreflightResult.builder()
 				.senderWalletId(senderBalance.getWalletId())
@@ -197,7 +201,7 @@ public class PreflightService {
 		}
 	}
 
-	private void validateAmountLimit(BigDecimal amount, TransactionType type) {
+	private void validateAmountLimit(BigDecimal amount, TransactionTypeEnum type) {
 		BigDecimal ceiling = switch (type) {
 			case P2P_TRANSFER      -> TxnConstants.MAX_P2P_AMOUNT;
 			case MERCHANT_PAYMENT  -> TxnConstants.MAX_MERCHANT_AMOUNT;
@@ -299,7 +303,7 @@ public class PreflightService {
 			String         senderWalletId,
 			String         receiverWalletId,
 			BigDecimal     amount,
-			TransactionType type) {
+			TransactionTypeEnum type) {
 		FraudEvaluationDto.Request req = FraudEvaluationDto.Request.builder()
 				.transactionType(type.name())
 				.senderUserId(sender.getUserId())

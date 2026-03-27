@@ -82,8 +82,10 @@ public class KafkaConfig {
 		props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
 		props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
 		props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-		props.put(JsonDeserializer.TRUSTED_PACKAGES, "com.digitalwallet.*");
+		props.put(JsonDeserializer.TRUSTED_PACKAGES, "com.deezyWallet.*");
 		props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+		props.put(JsonDeserializer.VALUE_DEFAULT_TYPE,
+				"java.util.LinkedHashMap");
 		return new DefaultKafkaConsumerFactory<>(props);
 	}
 
@@ -126,16 +128,19 @@ public class KafkaConfig {
 
 
 	// ── HTTP client config for sync service calls ─────────────────────────────
-	// (RestTemplate / WebClient beans would go here)
 	// Using simple RestTemplate for now — WebClient (reactive) is overkill
 	// for the low-frequency sync calls (fraud check, user status, balance preflight)
 
 	@Bean
-	public org.springframework.web.client.RestTemplate restTemplate() {
+	public org.springframework.web.client.RestTemplate restTemplate(
+			com.deezyWallet.transaction.security.InternalAuthInterceptor authInterceptor) {
 		// In production: configure connection pool, timeouts, circuit breaker
 		var factory = new org.springframework.http.client.SimpleClientHttpRequestFactory();
 		factory.setConnectTimeout(2000);  // 2s connect timeout
 		factory.setReadTimeout(3000);     // 3s read timeout (covers fraud service SLA)
-		return new org.springframework.web.client.RestTemplate(factory);
+
+		var restTemplate = new org.springframework.web.client.RestTemplate(factory);
+		restTemplate.getInterceptors().add(authInterceptor);
+		return restTemplate;
 	}
 }

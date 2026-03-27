@@ -1,4 +1,3 @@
-/*
 -- ─────────────────────────────────────────────────────────────────────────────
 -- V1__create_transaction_schema.sql
 -- Transaction Service — initial schema
@@ -6,6 +5,7 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- Main transaction table
+
 CREATE TABLE transactions (
     id                   VARCHAR(36)     NOT NULL,
     sender_user_id       VARCHAR(36)     NOT NULL,
@@ -58,4 +58,3 @@ CREATE TABLE saga_state (
 CREATE INDEX idx_saga_pending     ON saga_state (step_status, started_at);
 CREATE INDEX idx_saga_txn_id      ON saga_state (transaction_id);
 CREATE INDEX idx_saga_step_status ON saga_state (step_status);
-*/

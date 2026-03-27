@@ -1,33 +1,23 @@
-# STRUCTURE:
-#   Base config (no profile prefix) — shared defaults across ALL environments.
-#   Profile sections (--- spring.config.activate.on-profile) override the base.
+# Transaction Service — application configuration
 #
-#   Precedence (lowest → highest):
-#     application.yml base
-#     application-{profile}.yml  (if using separate files — we use inline here)
-#     Environment variables      (SPRING_DATASOURCE_URL etc.)
-#     Command-line args          (--server.port=8082)
+# TRANSACTION-SERVICE-SPECIFIC CONFIGURATION:
+#   - Downstream service URLs (user-service, wallet-service, fraud-service)
+#   - Saga timeout thresholds (debit, credit, reversal step timeouts)
+#   - Kafka consumer concurrency (wallet.events listener)
+#   - Redis idempotency lock TTL
+#   - RestTemplate timeouts per external service
 #
-#   Profile activation:
-#     local  → mvn spring-boot:run  (default, activeByDefault in pom.xml)
-#     docker → java -jar app.jar --spring.profiles.active=docker
-#     prod   → java -jar app.jar --spring.profiles.active=prod
-#              (injected via Kubernetes Deployment env: SPRING_PROFILES_ACTIVE=prod)
+# SECRETS STRATEGY: same as other services.
+#   local  → plaintext dev values
+#   docker → ${ENV_VAR} with Docker Compose .env defaults
+#   prod   → ${ENV_VAR} required (fails fast if missing), no plaintext
 #
-# SECRETS STRATEGY:
-#   local  → plain text values (dev only, never committed with real secrets)
-#   docker → plain text (Docker Compose .env file)
-#   prod   → ${ENV_VAR} references only — all secrets from Kubernetes Secrets
-#             mounted as environment variables or from Vault agent sidecar.
-#             NO plaintext secrets in this file for prod profile.
-#
-# NAMING CONVENTION:
-#   ${ENV_VAR:default} — env var with fallback default
-#   ${ENV_VAR}         — required env var, no default (fails fast if missing)
+# jwt.secret MUST be identical across all three services (User, Wallet, Transaction).
+# In production, all read from the same Vault path: secret/digitalwallet/jwt-signing-key
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BASE CONFIGURATION — shared by all profiles
+# BASE CONFIGURATION
 # ═════════════════════════════════════════════════════════════════════════════
 
 spring:
@@ -36,191 +26,138 @@ spring:
   profiles:
     default: local
 
-  # ── Jackson ────────────────────────────────────────────────────────────────
-  # These are backup defaults. Our JacksonConfig @Bean takes precedence
-  # but these ensure correct behaviour even if the @Bean is not picked up.
+
   jackson:
     serialization:
-      write-dates-as-timestamps: false      # LocalDateTime → ISO-8601 string
+      write-dates-as-timestamps: false
       fail-on-empty-beans: false
     deserialization:
-      fail-on-unknown-properties: false     # Kafka events may add new fields
-    default-property-inclusion: non_null    # @JsonInclude(NON_NULL) globally
+      fail-on-unknown-properties: false
+      # false — forward compatible: new fields from Wallet Service events are ignored
+    default-property-inclusion: non_null
 
-  # ── JPA / Hibernate ────────────────────────────────────────────────────────
   jpa:
     open-in-view: false
-    # WHY open-in-view: false?
-    #   Spring Boot enables this by default — it keeps the Hibernate Session
-    #   open for the full HTTP request lifecycle, including view rendering.
-    #   This causes lazy-loading to silently fire N+1 queries in templates.
-    #   We have no templates (REST API) and no lazy loading by design.
-    #   Disabling it means: if a lazy association is accidentally accessed
-    #   outside a @Transactional method, we get a clear LazyInitializationException
-    #   immediately rather than a hidden N+1 query in production.
     properties:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
-        format_sql: false                   # true only when debugging SQL
+        format_sql: false
         jdbc:
-          time_zone: UTC                    # all DB timestamps in UTC
-          batch_size: 25                    # batch INSERT/UPDATE for bulk ops
-        order_inserts: true                 # group INSERTs for batching
-        order_updates: true                 # group UPDATEs for batching
-        generate_statistics: false          # enable temporarily for SQL profiling
+          time_zone: UTC
+    hibernate:
+      ddl-auto: validate
 
-  # ── Flyway ─────────────────────────────────────────────────────────────────
   flyway:
     enabled: true
     locations: classpath:db/migration
-    baseline-on-migrate: false
-    # WHY baseline-on-migrate: false?
-    #   baseline-on-migrate=true marks the current DB state as version 1
-    #   if no flyway_schema_history table exists — useful for adopting Flyway
-    #   on an existing DB. We greenfield every environment so it stays false.
-    #   Setting it true accidentally on prod would skip all migrations silently.
-    out-of-order: false
-    # out-of-order: false means migration V3 cannot run if V2 is missing.
-    # Strict ordering enforced — prevents V1, V3, V2 applied in wrong order.
     validate-on-migrate: true
-    # validate-on-migrate: true checks migration checksums on startup.
-    # If a committed migration file is modified after being applied,
-    # service refuses to start — prevents silent schema drift.
+    baseline-on-migrate: false
 
-  # ── Kafka base (common across all profiles) ────────────────────────────────
+  # ── Kafka base config ─────────────────────────────────────────────────────
   kafka:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       acks: all
-      # acks=all → leader + all in-sync replicas must acknowledge.
-      # Slowest but safest — no message lost even if leader fails immediately
-      # after ack. Required for financial transactions.
-      retries: 3
       properties:
         enable.idempotence: true
-        # Kafka producer idempotence: prevents duplicate messages on retry.
-        # If the producer retries due to a network blip, Kafka deduplicates
-        # at the broker level using sequence numbers. Requires acks=all.
-        max.in.flight.requests.per.connection: 5
-        # Max 5 with idempotence enabled (Kafka docs requirement).
-        # >5 breaks the ordering guarantee with idempotence.
         spring.json.add.type.headers: false
-        # Do NOT add __TypeId__ headers to produced messages.
-        # Type headers couple producer and consumer to the same class path.
-        # Consumers deserialise to their own POJO types — no shared library needed.
-
+        # No type headers — Wallet Service consumers are Java-based but other
+        # consumers of txn.events (Ledger, Notification) may be polyglot.
+        max.in.flight.requests.per.connection: 5
+        # 5 in-flight requests max with idempotence enabled.
+        # Kafka idempotent producer requires <= 5; any higher and Kafka
+        # rejects the configuration at startup.
+        spring.json.value.default.type: "java.util.LinkedHashMap"
     consumer:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      auto-offset-reset: earliest
-      # earliest: on new consumer group, start from the beginning of the topic.
-      # latest would miss messages published before the consumer group existed.
-      # For wallet commands this is critical — we cannot miss a DEBIT_CMD.
       enable-auto-commit: false
-      # NEVER auto-commit with manual ACK strategy.
-      # We ACK manually (Acknowledgment.acknowledge()) only after successful
-      # processing. Auto-commit would advance the offset before processing
-      # completes — message lost if service crashes mid-processing.
+      auto-offset-reset: earliest
       properties:
-        spring.json.trusted.packages: "com.deezyWallet.*"
-        # Whitelist of packages JsonDeserializer will deserialise.
-        # Prevents arbitrary class instantiation from Kafka messages
-        # (a security concern if Kafka is shared with untrusted producers).
+        spring.json.trusted.packages: "com.deezylwallet.*"
         spring.json.use.type.headers: false
-        # Don't require __TypeId__ header — pairs with add.type.headers=false above.
-        # Each listener maps its topic to the correct POJO explicitly.
-        spring.json.value.default.type: "java.util.LinkedHashMap"
-        # Default deserialization target when no type headers are present.
-        # Consumers manually convert from Map to their specific event POJOs.
+        # No type headers on consume side matches our producer config.
+        # We route based on the eventType field in the payload, not headers.
 
-  # ── Data / Redis base ──────────────────────────────────────────────────────
   data:
     redis:
       timeout: 2000ms
-      # Connection timeout: 2s. If Redis doesn't respond in 2s, fail fast.
-      # BalanceCacheService catches the exception and falls back to DB.
       lettuce:
         pool:
-          max-active: 8     # max concurrent connections
-          max-idle: 8
-          min-idle: 2
-          max-wait: 1000ms  # block 1s waiting for connection before exception
+          max-active: 8
+          max-idle: 4
+          min-idle: 1
+          max-wait: 1000ms
 
-# ── Server ────────────────────────────────────────────────────────────────────
 server:
-  port: 8082
-  # Wallet Service runs on 8082.
-  # Convention: User Service=8081, Wallet=8082, Transaction=8083 etc.
-  servlet:
-    context-path: /
-  error:
-    include-message: never
-    # never: never include the exception message in the /error response body.
-    # Prevents stack traces and internal details leaking to clients.
-    # GlobalExceptionHandler handles all errors with clean ErrorResponse.
-    include-stacktrace: never
-    include-binding-errors: never
+  port: 8084
+  # Transaction Service: port 8084. Convention: 808{service number}.
+  # User: 8081, Wallet: 8082, Transaction: 8083.
+  compression:
+    enabled: true
+    mime-types: application/json
+    min-response-size: 1024
 
-# ── Actuator ──────────────────────────────────────────────────────────────────
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,prometheus
-        # Expose only what we use. Never expose: env, beans, mappings in prod
-        # (they leak config and class structure).
-      base-path: /actuator
+        include: health, info
   endpoint:
     health:
       show-details: when-authorized
-      # show-details: when-authorized — full health detail (DB, Redis, Kafka)
-      # only for authenticated requests. /actuator/health returns UP/DOWN
-      # to unauthenticated callers (Kubernetes probes) — no internals leaked.
-      probes:
-        enabled: true
-        # Enables /actuator/health/liveness and /actuator/health/readiness
-        # for Kubernetes liveness and readiness probes separately.
-  metrics:
-    tags:
-      application: ${spring.application.name}
-      # Tag all metrics with service name → filter in Grafana by service.
 
-# ── JWT base (secret injected per profile) ────────────────────────────────────
+# ── JWT (resource server — validates only, never issues) ─────────────────────
 jwt:
   issuer: digital-wallet-platform
-  expiration-ms: 86400000   # 24 hours in milliseconds
+  # secret: SET PER PROFILE
 
-# ── Wallet service constants ───────────────────────────────────────────────────
-wallet:
-  limits:
-    default-daily-limit: 50000.0000
-    default-monthly-limit: 200000.0000
-  cache:
-    balance-ttl-seconds: 30
-    lock-ttl-seconds: 10
-    user-wallet-ttl-seconds: 300
+# ── Downstream service base URLs ──────────────────────────────────────────────
+# Injected into PreflightService via @Value
+services:
+  user-service:
+    base-url: http://user-service:8081      # overridden per profile
+  wallet-service:
+    base-url: http://wallet-service:8082    # overridden per profile
+  fraud-service:
+    base-url: http://fraud-service:8090     # overridden per profile
 
-# ── Logging base ──────────────────────────────────────────────────────────────
-logging:
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
-  level:
-    root: INFO
-    com.deezyWallet.walletService: INFO
-    org.springframework.security: WARN
-    # WARN for Spring Security — INFO is extremely verbose (logs every filter chain decision)
-    org.springframework.kafka: WARN
-    # WARN for Kafka — INFO logs every poll cycle (noisy in normal operation)
-    org.hibernate.SQL: WARN
-    # Change to DEBUG temporarily to see generated SQL during development
-    org.flywaydb: DEBUG
+# ── Kafka topic names (overridable for testing) ────────────────────────────────
+kafka:
+  topics:
+    wallet-commands: wallet.commands
+    wallet-events: wallet.events
+    txn-events: txn.events
+  consumer:
+    concurrency: 3
+    # 3 concurrent consumer threads per partition.
+    # Transactions keyed by transactionId → same partition → ordering preserved.
+    # 3 threads = 3 independent transactions can be processed in parallel.
+    # Increase if wallet.events consumer lag grows under high load.
+
+# ── Saga timeouts (seconds) ───────────────────────────────────────────────────
+# Extracted to YAML so they can be tuned per environment without redeployment.
+# SagaTimeoutJob reads TxnConstants but these override via @Value if needed.
+saga:
+  timeout:
+    debit-seconds: 300       # 5 minutes — PENDING_DEBIT step timeout
+    credit-seconds: 300      # 5 minutes — PENDING_CREDIT step timeout
+    reversal-seconds: 600    # 10 minutes — REVERSING step timeout
+  timeout-job:
+    interval-ms: 60000       # Job runs every 60 seconds
+
+# ── Async executor (for future @Async methods) ────────────────────────────────
+spring.task.execution:
+  pool:
+    core-size: 4
+    max-size: 8
+    queue-capacity: 100
+  thread-name-prefix: txn-async-
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LOCAL PROFILE — developer machines
-# Activated by default (pom.xml activeByDefault=true)
-# All values hardcoded — connect to local Docker Compose services.
+# LOCAL PROFILE
 # ═════════════════════════════════════════════════════════════════════════════
 ---
 spring:
@@ -229,79 +166,49 @@ spring:
       on-profile: local
 
   datasource:
-    url: jdbc:mysql://localhost:3306/transaction_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
-    # useSSL=false         — no SSL for local dev (MySQL requires SSL by default in 8.x)
-    # serverTimezone=UTC   — align MySQL session timezone with Hibernate UTC setting
-    # allowPublicKeyRetrieval=true — required for MySQL 8 caching_sha2_password auth
-    #                                without SSL (dev only — never in prod)
+    url: jdbc:mysql://localhost:3306/transaction_db?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&characterEncoding=UTF-8
     username: root
     password:
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
-      pool-name: TransactionHikariPool-local
+      pool-name: TxnServicePool-Local
       maximum-pool-size: 5
-      # Small pool for local dev — don't exhaust local MySQL connections.
-      minimum-idle: 2
-      connection-timeout: 30000
-      idle-timeout: 600000
-      max-lifetime: 1800000
-      connection-test-query: SELECT 1
+      minimum-idle: 1
+      connection-timeout: 10000
+      idle-timeout: 300000
+      max-lifetime: 900000
 
   data:
     redis:
       host: localhost
       port: 6379
-      password:           # no password for local Redis
-      database: 0
 
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
       group-id: transaction-service-local
-      # Separate group-id per environment — prevents local consumer stealing
-      # messages meant for the Docker/prod consumer group.
-
-  jpa:
-    show-sql: true
-    # show-sql: true — log all Hibernate SQL to console in local dev.
-    # Switch to org.hibernate.SQL=DEBUG in logging for formatted output.
-    hibernate:
-      ddl-auto: validate
-      # validate: Hibernate validates entity mappings against the DB schema
-      # but makes NO changes. Flyway owns all schema changes.
-      # WHY not create-drop or update?
-      #   create-drop destroys data on restart — dangerous even locally.
-      #   update silently adds columns but never removes them (schema drift).
-      #   validate + Flyway = clean, auditable schema management.
-
-  flyway:
-    url: jdbc:mysql://localhost:3306/transaction_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
-    user: root
-    password:
-    # Flyway uses its own connection (not Hikari) to run migrations before
-    # the app context starts. Must match datasource URL exactly.
 
 jwt:
   secret: bG9jYWwtZGV2LXNlY3JldC1mb3ItdXNlci1zZXJ2aWNlLW9ubHktbm90LXByb2R1Y3Rpb24tNjRieXRlc21pbg==
-  # HS512 requires minimum 512 bits (64 bytes). This dev secret is exactly
-  # 64+ chars. NEVER use this value outside local dev.
+
+# Downstream service URLs — all on localhost when running without Docker Compose
+services:
+  user-service:
+    base-url: http://localhost:8083
+  wallet-service:
+    base-url: http://localhost:8082
+  fraud-service:
+    base-url: http://localhost:8090
 
 logging:
   level:
-    com.deezyWallet.walletService: DEBUG
-    # DEBUG in local — see all service log statements including cache hits/misses,
-    # lock acquisitions, debit/credit steps.
+    root: INFO
+    com.deezyWallet.transaction: DEBUG
     org.hibernate.SQL: DEBUG
-    # See generated SQL — useful for verifying locking queries (SELECT FOR UPDATE),
-    # upserts (INSERT ... ON DUPLICATE KEY UPDATE), and pagination queries.
     org.hibernate.type.descriptor.sql: TRACE
-    # TRACE — see bind parameter values alongside SQL. Very verbose.
-    # Disable if logs are too noisy. Never enable in prod (logs PII/amounts).
-  cloud:
-    discovery:
-      enabled: true
+    org.springframework.kafka: INFO
+    org.springframework.security: DEBUG
+    org.flywaydb: INFO
 
-  eureka:
-    client:
-      service-url:
-        defaultZone: http://localhost:8761/eureka
+server:
+  port: 8084

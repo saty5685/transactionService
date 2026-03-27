@@ -18,7 +18,7 @@
     <version>1.0.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>transactionService</name>
-    <description>Digital Wallet — Transaction Microservice</description>
+    <description>Digital Wallet — Transaction &amp; Saga Orchestrator Microservice</description>
 
     <properties>
         <!-- Java -->
@@ -49,7 +49,7 @@
         <!-- Build -->
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>
-        <maven.compiler.release>17</maven.compiler.release>
+        <maven.compiler.release>${java.version}</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -92,6 +92,12 @@
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
         </dependency>
 
         <dependency>
@@ -222,8 +228,8 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>com.digitalwallet</groupId>
-            <artifactId>walletService</artifactId>
+            <groupId>com.deezyWallet</groupId>
+            <artifactId>transactionService</artifactId>
             <version>1.0.0-SNAPSHOT</version>
             <scope>test</scope>
         </dependency>

@@ -1,7 +1,15 @@
 package com.deezyWallet.transaction.service;
 
+import java.time.Duration;
+import java.util.UUID;
+
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
 import com.deezyWallet.transaction.constants.TxnConstants;
-import com.deezyWallet.transaction.constants.TxnErrorCode;
 import com.deezyWallet.transaction.dto.request.MerchantPayRequest;
 import com.deezyWallet.transaction.dto.request.TransferRequest;
 import com.deezyWallet.transaction.dto.response.AdminTransactionResponse;
@@ -9,28 +17,22 @@ import com.deezyWallet.transaction.dto.response.PagedResponse;
 import com.deezyWallet.transaction.dto.response.TransactionResponse;
 import com.deezyWallet.transaction.entity.SagaState;
 import com.deezyWallet.transaction.entity.Transaction;
-import com.deezyWallet.transaction.enums.*;
+import com.deezyWallet.transaction.enums.SagaStepEnum;
+import com.deezyWallet.transaction.enums.TransactionStatusEnum;
+import com.deezyWallet.transaction.enums.TransactionTypeEnum;
 import com.deezyWallet.transaction.event.TxnEventPublisher;
 import com.deezyWallet.transaction.event.WalletCommandPublisher;
-import com.deezyWallet.transaction.exception.*;
+import com.deezyWallet.transaction.exception.DuplicateTransactionException;
+import com.deezyWallet.transaction.exception.TransactionAccessDeniedException;
+import com.deezyWallet.transaction.exception.TransactionNotFoundException;
+import com.deezyWallet.transaction.exception.TransactionNotReversibleException;
 import com.deezyWallet.transaction.mapper.TransactionMapper;
 import com.deezyWallet.transaction.repository.SagaStateRepository;
 import com.deezyWallet.transaction.repository.TransactionRepository;
 import com.deezyWallet.transaction.security.UserPrincipal;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.Page;
-import org.springframework.data.domain.Pageable;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.orm.ObjectOptimisticLockingFailureException;
-import org.springframework.retry.annotation.Backoff;
-import org.springframework.retry.annotation.Retryable;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
-
-import java.time.Duration;
-import java.time.LocalDateTime;
-import java.util.UUID;
 
 /**
  * TransactionService — initiates transactions and drives the Saga.
@@ -201,6 +203,18 @@ public class TransactionService {
 		return mapper.toResponse(txn);
 	}
 
+
+	@Transactional(readOnly = true)
+	public TransactionResponse getTransactionInternal(String txnId) {
+		// No ownership check — called by trusted internal services only
+		// Route security enforced by ROLE_INTERNAL_SERVICE JWT check in SecurityConfig
+		return transactionRepository.findById(txnId)
+				.map(mapper::toResponse)
+				.orElseThrow(() -> new TransactionNotFoundException(
+						"Transaction not found: " + txnId));
+	}
+
+
 	@Transactional(readOnly = true)
 	public PagedResponse<TransactionResponse> getUserTransactions(
 			String userId, TransactionStatusEnum statusFilter, Pageable pageable) {
@@ -334,7 +348,7 @@ public class TransactionService {
 	private void publishDebitCommand(Transaction txn) {
 		try {
 			SagaState debitStep = sagaStateRepository
-					.findByTransactionIdAndStep(txn.getId(), SagaStep.DEBIT_SENDER)
+					.findByTransactionIdAndStep(txn.getId(), SagaStepEnum.DEBIT_SENDER)
 					.orElseThrow();
 			walletCommandPublisher.publishDebitCommand(txn, debitStep.getCommandIdempotencyKey());
 		} catch (Exception e) {
