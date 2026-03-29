@@ -33,7 +33,19 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 public class WalletBalanceDto {
 	private String     walletId;
-	private BigDecimal availableBalance;
+	private BigDecimal balance;          // maps to "balance" in BalanceResponse JSON
 	private BigDecimal blockedBalance;
-	private String     source; // "CACHE" or "DB"
+	private String     currency;
+	private String     source;           // "CACHE" or "DB"
+
+	/**
+	 * Computed available balance = balance - blockedBalance.
+	 * In the current simplified model balance IS available balance,
+	 * but subtracting blocked keeps us safe if the model changes.
+	 */
+	public BigDecimal getAvailableBalance() {
+		if (balance == null) return BigDecimal.ZERO;
+		BigDecimal blocked = blockedBalance != null ? blockedBalance : BigDecimal.ZERO;
+		return balance.subtract(blocked);
+	}
 }
